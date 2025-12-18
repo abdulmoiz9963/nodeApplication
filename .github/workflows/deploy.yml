@@ -67,6 +67,45 @@ jobs:
       working-directory: ./terraform
       run: terraform apply -auto-approve tfplan
 
+    - name: Update Worker Service with MongoDB Connection
+      run: |
+        # Get MongoDB instance private IP
+        MONGODB_IP=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=ecs-instance" "Name=instance-state-name,Values=running" \
+          --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+          --output text)
+        
+        # Update worker task definition with correct MongoDB host
+        aws ecs register-task-definition \
+          --family worker-task \
+          --task-role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/ecsTaskRole \
+          --execution-role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/ecsTaskExecutionRole \
+          --network-mode bridge \
+          --requires-compatibilities EC2 \
+          --container-definitions '[{
+            "name": "worker",
+            "image": "'${{ steps.login-ecr.outputs.registry }}'/microservice-worker:latest",
+            "cpu": 0,
+            "memory": 256,
+            "essential": true,
+            "portMappings": [{"containerPort": 80, "hostPort": 0, "protocol": "tcp"}],
+            "environment": [{"name": "DBHOST", "value": "mongodb://'$MONGODB_IP':27017"}],
+            "logConfiguration": {
+              "logDriver": "awslogs",
+              "options": {
+                "awslogs-group": "/ecs/worker-task",
+                "awslogs-region": "us-east-1",
+                "awslogs-stream-prefix": "ecs"
+              }
+            }
+          }]'
+        
+        # Update worker service
+        aws ecs update-service \
+          --cluster microservice-cluster \
+          --service worker-service \
+          --task-definition worker-task
+
     - name: Get ALB DNS Name
       working-directory: ./terraform
       run: |
