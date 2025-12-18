@@ -1,0 +1,73 @@
+name: Deploy to ECS with Terraform
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY_GATEWAY: microservice-gateway
+  ECR_REPOSITORY_WORKER: microservice-worker
+  TF_VERSION: 1.6.0
+
+jobs:
+  deploy:
+    name: Deploy Infrastructure and Services
+    runs-on: ubuntu-latest
+      
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build and push gateway image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:$IMAGE_TAG ./gateway
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:latest ./gateway
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:latest
+
+    - name: Build and push worker image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:$IMAGE_TAG ./worker
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:latest ./worker
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:latest
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: terraform init
+
+    - name: Terraform Plan
+      working-directory: ./terraform
+      run: terraform plan -out=tfplan
+
+    - name: Terraform Apply
+      working-directory: ./terraform
+      run: terraform apply -auto-approve tfplan
+
+    - name: Get ALB DNS Name
+      working-directory: ./terraform
+      run: |
+        echo "Application URL: http://$(terraform output -raw alb_dns_name)"
