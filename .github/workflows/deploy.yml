@@ -1,4 +1,4 @@
-name: Deploy to ECS with Terraform
+name: Deploy to ECS
 
 on:
   push:
@@ -8,11 +8,10 @@ env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY_GATEWAY: microservice-gateway
   ECR_REPOSITORY_WORKER: microservice-worker
-  TF_VERSION: 1.6.0
 
 jobs:
   deploy:
-    name: Deploy Infrastructure and Services
+    name: Deploy Services
     runs-on: ubuntu-latest
       
     steps:
@@ -50,32 +49,15 @@ jobs:
         docker push $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:latest
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
-
-    - name: Terraform Init
-      working-directory: ./terraform
-      run: terraform init
-
-    - name: Terraform Plan
-      working-directory: ./terraform
-      run: terraform plan -out=tfplan
-
-    - name: Terraform Apply
-      working-directory: ./terraform
-      run: terraform apply -auto-approve tfplan
-
-    - name: Update Worker Service with MongoDB Connection
+    - name: Update ECS Services
       run: |
         # Get MongoDB instance private IP
         MONGODB_IP=$(aws ec2 describe-instances \
           --filters "Name=tag:Name,Values=ecs-instance" "Name=instance-state-name,Values=running" \
-          --query 'Reservations[0].Instances[0].PrivateIpAddress' \
-          --output text)
+          --query 'Reservations[].Instances[?Tags[?Key==`Name` && Value==`ecs-instance`]].PrivateIpAddress' \
+          --output text | head -1)
         
-        # Update worker task definition with correct MongoDB host
+        # Update worker task definition
         aws ecs register-task-definition \
           --family worker-task \
           --task-role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/ecsTaskRole \
@@ -100,13 +82,11 @@ jobs:
             }
           }]'
         
-        # Update worker service
-        aws ecs update-service \
-          --cluster microservice-cluster \
-          --service worker-service \
-          --task-definition worker-task
+        # Update services
+        aws ecs update-service --cluster microservice-cluster --service gateway-service --force-new-deployment
+        aws ecs update-service --cluster microservice-cluster --service worker-service --task-definition worker-task --force-new-deployment
 
-    - name: Get ALB DNS Name
-      working-directory: ./terraform
+    - name: Get Application URL
       run: |
-        echo "Application URL: http://$(terraform output -raw alb_dns_name)"
+        ALB_DNS=$(aws elbv2 describe-load-balancers --names microservice-alb --query 'LoadBalancers[0].DNSName' --output text)
+        echo "Application URL: http://$ALB_DNS"
