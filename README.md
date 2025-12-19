@@ -238,3 +238,4 @@ az aks get-credentials --resource-group <resource-group> --name <cluster-name> -
 ```
 
 Cut and paste the result into the KUBE_CONFIG secret.
+# Clean deployment ready
