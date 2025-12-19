@@ -29,10 +29,15 @@ jobs:
       run: |
         echo "=== CLEANING UP EXISTING RESOURCES ==="
         
-        # Delete ECS services
+        # Delete ECS services first
         aws ecs list-services --cluster microservice-cluster --query 'serviceArns' --output text 2>/dev/null | xargs -n1 aws ecs update-service --cluster microservice-cluster --desired-count 0 --service 2>/dev/null || true
-        sleep 30
+        sleep 60
         aws ecs list-services --cluster microservice-cluster --query 'serviceArns' --output text 2>/dev/null | xargs -n1 aws ecs delete-service --cluster microservice-cluster --force --service 2>/dev/null || true
+        
+        # Force delete Auto Scaling Group and wait
+        aws autoscaling delete-auto-scaling-group --auto-scaling-group-name ecs-asg --force-delete 2>/dev/null || true
+        echo "Waiting for ASG deletion..."
+        sleep 120
         
         # Delete ECS cluster
         aws ecs delete-cluster --cluster microservice-cluster 2>/dev/null || true
@@ -43,9 +48,6 @@ jobs:
         # Delete target groups
         aws elbv2 describe-target-groups --names gateway-tg --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null | xargs aws elbv2 delete-target-group --target-group-arn 2>/dev/null || true
         aws elbv2 describe-target-groups --names worker-tg --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null | xargs aws elbv2 delete-target-group --target-group-arn 2>/dev/null || true
-        
-        # Delete Auto Scaling Group
-        aws autoscaling delete-auto-scaling-group --auto-scaling-group-name ecs-asg --force-delete 2>/dev/null || true
         
         # Delete Launch Template
         aws ec2 delete-launch-template --launch-template-name ecs-launch-template 2>/dev/null || true
@@ -64,6 +66,9 @@ jobs:
         aws iam delete-role --role-name ecsTaskExecutionRole 2>/dev/null || true
         aws iam delete-role --role-name ecsTaskRole 2>/dev/null || true
         
+        # Wait for ALB deletion
+        sleep 60
+        
         # Delete VPCs and dependencies
         for vpc in $(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=microservice-app" --query 'Vpcs[].VpcId' --output text 2>/dev/null); do
           aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc" --query 'Subnets[].SubnetId' --output text | xargs -n1 aws ec2 delete-subnet --subnet-id 2>/dev/null || true
@@ -72,6 +77,10 @@ jobs:
           aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$vpc" --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text | xargs -n1 aws ec2 delete-security-group --group-id 2>/dev/null || true
           aws ec2 delete-vpc --vpc-id $vpc 2>/dev/null || true
         done
+        
+        # Final wait to ensure all resources are deleted
+        echo "Final cleanup wait..."
+        sleep 60
         
         echo "=== CLEANUP COMPLETE ==="
 
