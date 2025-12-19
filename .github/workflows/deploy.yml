@@ -8,16 +8,25 @@ env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY_GATEWAY: microservice-gateway
   ECR_REPOSITORY_WORKER: microservice-worker
+  ECS_CLUSTER: microservice-cluster
+  ECS_GATEWAY_SERVICE: gateway-service
+  ECS_WORKER_SERVICE: worker-service
 
 jobs:
   deploy:
-    name: Deploy Services
+    name: Build & Deploy Services
     runs-on: ubuntu-latest
-      
+
     steps:
-    - name: Checkout
+    # --------------------------------------------------
+    # Checkout code
+    # --------------------------------------------------
+    - name: Checkout repository
       uses: actions/checkout@v3
 
+    # --------------------------------------------------
+    # AWS Credentials
+    # --------------------------------------------------
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
@@ -25,85 +34,67 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_version: 1.6.0
-
-    - name: Terraform Init
-      working-directory: ./terraform
-      run: terraform init
-
-    - name: Terraform Plan
-      working-directory: ./terraform
-      run: terraform plan -out=tfplan
-
-    - name: Terraform Apply
-      working-directory: ./terraform
-      run: terraform apply -auto-approve tfplan
-
+    # --------------------------------------------------
+    # Login to Amazon ECR
+    # --------------------------------------------------
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
 
+    # --------------------------------------------------
+    # Build & Push Gateway Image
+    # --------------------------------------------------
     - name: Build and push gateway image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         IMAGE_TAG: ${{ github.sha }}
       run: |
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:$IMAGE_TAG ./gateway
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:latest ./gateway
+        docker tag  $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:$IMAGE_TAG \
+                    $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:latest
         docker push $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:latest
 
+    # --------------------------------------------------
+    # Build & Push Worker Image
+    # --------------------------------------------------
     - name: Build and push worker image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         IMAGE_TAG: ${{ github.sha }}
       run: |
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:$IMAGE_TAG ./worker
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:latest ./worker
+        docker tag  $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:$IMAGE_TAG \
+                    $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:latest
         docker push $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:latest
 
-    - name: Update ECS Services
+    # --------------------------------------------------
+    # Force ECS Redeploy (NO infra changes)
+    # --------------------------------------------------
+    - name: Deploy ECS services
       run: |
-        # Get MongoDB instance private IP
-        MONGODB_IP=$(aws ec2 describe-instances \
-          --filters "Name=tag:Name,Values=ecs-instance" "Name=instance-state-name,Values=running" \
-          --query 'Reservations[].Instances[?Tags[?Key==`Name` && Value==`ecs-instance`]].PrivateIpAddress' \
-          --output text | head -1)
-        
-        # Update worker task definition
-        aws ecs register-task-definition \
-          --family worker-task \
-          --task-role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/ecsTaskRole \
-          --execution-role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/ecsTaskExecutionRole \
-          --network-mode bridge \
-          --requires-compatibilities EC2 \
-          --container-definitions '[{
-            "name": "worker",
-            "image": "'${{ steps.login-ecr.outputs.registry }}'/microservice-worker:latest",
-            "cpu": 0,
-            "memory": 256,
-            "essential": true,
-            "portMappings": [{"containerPort": 80, "hostPort": 0, "protocol": "tcp"}],
-            "environment": [{"name": "DBHOST", "value": "mongodb://'$MONGODB_IP':27017"}],
-            "logConfiguration": {
-              "logDriver": "awslogs",
-              "options": {
-                "awslogs-group": "/ecs/worker-task",
-                "awslogs-region": "us-east-1",
-                "awslogs-stream-prefix": "ecs"
-              }
-            }
-          }]'
-        
-        # Update services
-        aws ecs update-service --cluster microservice-cluster --service gateway-service --force-new-deployment
-        aws ecs update-service --cluster microservice-cluster --service worker-service --task-definition worker-task --force-new-deployment
+        aws ecs update-service \
+          --cluster $ECS_CLUSTER \
+          --service $ECS_GATEWAY_SERVICE \
+          --force-new-deployment
 
+        aws ecs update-service \
+          --cluster $ECS_CLUSTER \
+          --service $ECS_WORKER_SERVICE \
+          --force-new-deployment
+
+    # --------------------------------------------------
+    # Output Application URL
+    # --------------------------------------------------
     - name: Get Application URL
       run: |
-        ALB_DNS=$(aws elbv2 describe-load-balancers --names microservice-alb --query 'LoadBalancers[0].DNSName' --output text)
-        echo "Application URL: http://$ALB_DNS"
+        ALB_DNS=$(aws elbv2 describe-load-balancers \
+          --names microservice-alb \
+          --query 'LoadBalancers[0].DNSName' \
+          --output text)
+
+        echo "======================================"
+        echo "Application URL:"
+        echo "http://$ALB_DNS"
+        echo "======================================"
