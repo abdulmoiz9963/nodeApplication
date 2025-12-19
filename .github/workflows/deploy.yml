@@ -1,4 +1,4 @@
-name: Deploy to ECS
+name: Deploy to ECS with Auto-Cleanup
 
 on:
   push:
@@ -8,25 +8,16 @@ env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY_GATEWAY: microservice-gateway
   ECR_REPOSITORY_WORKER: microservice-worker
-  ECS_CLUSTER: microservice-cluster
-  ECS_GATEWAY_SERVICE: gateway-service
-  ECS_WORKER_SERVICE: worker-service
 
 jobs:
   deploy:
-    name: Build & Deploy Services
+    name: Deploy Infrastructure and Services
     runs-on: ubuntu-latest
-
+      
     steps:
-    # --------------------------------------------------
-    # Checkout code
-    # --------------------------------------------------
-    - name: Checkout repository
+    - name: Checkout
       uses: actions/checkout@v3
 
-    # --------------------------------------------------
-    # AWS Credentials
-    # --------------------------------------------------
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
@@ -34,67 +25,142 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
 
-    # --------------------------------------------------
-    # Login to Amazon ECR
-    # --------------------------------------------------
+    - name: Cleanup Existing Resources
+      run: |
+        echo "=== CLEANING UP EXISTING RESOURCES ==="
+        
+        # Delete ECS services
+        aws ecs list-services --cluster microservice-cluster --query 'serviceArns' --output text 2>/dev/null | xargs -n1 aws ecs update-service --cluster microservice-cluster --desired-count 0 --service 2>/dev/null || true
+        sleep 30
+        aws ecs list-services --cluster microservice-cluster --query 'serviceArns' --output text 2>/dev/null | xargs -n1 aws ecs delete-service --cluster microservice-cluster --force --service 2>/dev/null || true
+        
+        # Delete ECS cluster
+        aws ecs delete-cluster --cluster microservice-cluster 2>/dev/null || true
+        
+        # Delete ALB
+        aws elbv2 describe-load-balancers --names microservice-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null | xargs aws elbv2 delete-load-balancer --load-balancer-arn 2>/dev/null || true
+        
+        # Delete target groups
+        aws elbv2 describe-target-groups --names gateway-tg --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null | xargs aws elbv2 delete-target-group --target-group-arn 2>/dev/null || true
+        aws elbv2 describe-target-groups --names worker-tg --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null | xargs aws elbv2 delete-target-group --target-group-arn 2>/dev/null || true
+        
+        # Delete Auto Scaling Group
+        aws autoscaling delete-auto-scaling-group --auto-scaling-group-name ecs-asg --force-delete 2>/dev/null || true
+        
+        # Delete Launch Template
+        aws ec2 delete-launch-template --launch-template-name ecs-launch-template 2>/dev/null || true
+        
+        # Delete CloudWatch Log Groups
+        aws logs delete-log-group --log-group-name /ecs/gateway-task 2>/dev/null || true
+        aws logs delete-log-group --log-group-name /ecs/worker-task 2>/dev/null || true
+        aws logs delete-log-group --log-group-name /ecs/mongodb-task 2>/dev/null || true
+        
+        # Delete IAM roles and instance profiles
+        aws iam remove-role-from-instance-profile --instance-profile-name ecsInstanceProfile --role-name ecsInstanceRole 2>/dev/null || true
+        aws iam delete-instance-profile --instance-profile-name ecsInstanceProfile 2>/dev/null || true
+        aws iam detach-role-policy --role-name ecsInstanceRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role 2>/dev/null || true
+        aws iam detach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy 2>/dev/null || true
+        aws iam delete-role --role-name ecsInstanceRole 2>/dev/null || true
+        aws iam delete-role --role-name ecsTaskExecutionRole 2>/dev/null || true
+        aws iam delete-role --role-name ecsTaskRole 2>/dev/null || true
+        
+        # Delete VPCs and dependencies
+        for vpc in $(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=microservice-app" --query 'Vpcs[].VpcId' --output text 2>/dev/null); do
+          aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc" --query 'Subnets[].SubnetId' --output text | xargs -n1 aws ec2 delete-subnet --subnet-id 2>/dev/null || true
+          aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$vpc" --query 'InternetGateways[].InternetGatewayId' --output text | xargs -I {} sh -c 'aws ec2 detach-internet-gateway --internet-gateway-id {} --vpc-id '$vpc' && aws ec2 delete-internet-gateway --internet-gateway-id {}' 2>/dev/null || true
+          aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc" --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text | xargs -n1 aws ec2 delete-route-table --route-table-id 2>/dev/null || true
+          aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$vpc" --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text | xargs -n1 aws ec2 delete-security-group --group-id 2>/dev/null || true
+          aws ec2 delete-vpc --vpc-id $vpc 2>/dev/null || true
+        done
+        
+        echo "=== CLEANUP COMPLETE ==="
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.6.0
+
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: terraform init
+
+    - name: Terraform Plan
+      working-directory: ./terraform
+      run: terraform plan -out=tfplan
+
+    - name: Terraform Apply
+      working-directory: ./terraform
+      run: terraform apply -auto-approve tfplan
+
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
 
-    # --------------------------------------------------
-    # Build & Push Gateway Image
-    # --------------------------------------------------
     - name: Build and push gateway image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         IMAGE_TAG: ${{ github.sha }}
       run: |
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:$IMAGE_TAG ./gateway
-        docker tag  $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:$IMAGE_TAG \
-                    $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:latest
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:latest ./gateway
         docker push $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_REPOSITORY_GATEWAY:latest
 
-    # --------------------------------------------------
-    # Build & Push Worker Image
-    # --------------------------------------------------
     - name: Build and push worker image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         IMAGE_TAG: ${{ github.sha }}
       run: |
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:$IMAGE_TAG ./worker
-        docker tag  $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:$IMAGE_TAG \
-                    $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:latest
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:latest ./worker
         docker push $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_REPOSITORY_WORKER:latest
 
-    # --------------------------------------------------
-    # Force ECS Redeploy (NO infra changes)
-    # --------------------------------------------------
-    - name: Deploy ECS services
+    - name: Update ECS Services with MongoDB Connection
       run: |
-        aws ecs update-service \
-          --cluster $ECS_CLUSTER \
-          --service $ECS_GATEWAY_SERVICE \
-          --force-new-deployment
+        # Wait for ECS cluster to be ready
+        sleep 60
+        
+        # Get MongoDB instance private IP
+        MONGODB_IP=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=ecs-instance" "Name=instance-state-name,Values=running" \
+          --query 'Reservations[].Instances[?Tags[?Key==`Name` && Value==`ecs-instance`]].PrivateIpAddress' \
+          --output text | head -1)
+        
+        echo "MongoDB IP: $MONGODB_IP"
+        
+        # Update worker task definition with correct MongoDB connection
+        aws ecs register-task-definition \
+          --family worker-task \
+          --task-role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/ecsTaskRole \
+          --execution-role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/ecsTaskExecutionRole \
+          --network-mode bridge \
+          --requires-compatibilities EC2 \
+          --container-definitions '[{
+            "name": "worker",
+            "image": "'${{ steps.login-ecr.outputs.registry }}'/microservice-worker:latest",
+            "cpu": 0,
+            "memory": 256,
+            "essential": true,
+            "portMappings": [{"containerPort": 80, "hostPort": 0, "protocol": "tcp"}],
+            "environment": [{"name": "DBHOST", "value": "mongodb://'$MONGODB_IP':27017"}],
+            "logConfiguration": {
+              "logDriver": "awslogs",
+              "options": {
+                "awslogs-group": "/ecs/worker-task",
+                "awslogs-region": "us-east-1",
+                "awslogs-stream-prefix": "ecs"
+              }
+            }
+          }]'
+        
+        # Update services to use latest images
+        aws ecs update-service --cluster microservice-cluster --service gateway-service --force-new-deployment
+        aws ecs update-service --cluster microservice-cluster --service worker-service --task-definition worker-task --force-new-deployment
 
-        aws ecs update-service \
-          --cluster $ECS_CLUSTER \
-          --service $ECS_WORKER_SERVICE \
-          --force-new-deployment
-
-    # --------------------------------------------------
-    # Output Application URL
-    # --------------------------------------------------
     - name: Get Application URL
       run: |
-        ALB_DNS=$(aws elbv2 describe-load-balancers \
-          --names microservice-alb \
-          --query 'LoadBalancers[0].DNSName' \
-          --output text)
-
-        echo "======================================"
-        echo "Application URL:"
-        echo "http://$ALB_DNS"
-        echo "======================================"
+        ALB_DNS=$(aws elbv2 describe-load-balancers --names microservice-alb --query 'LoadBalancers[0].DNSName' --output text)
+        echo "🚀 Application URL: http://$ALB_DNS"
+        echo "📊 Gateway: http://$ALB_DNS/"
+        echo "🔧 Worker API: http://$ALB_DNS/api/data"
